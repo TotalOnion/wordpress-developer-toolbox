@@ -2,6 +2,7 @@
 
 namespace OnionWordpressDeveloperToolbox\Controllers\Command;
 
+use DateTimeImmutable;
 use \WP_CLI;
 
 class RedirectionAuditCommand extends AbstractCommandController
@@ -19,22 +20,34 @@ class RedirectionAuditCommand extends AbstractCommandController
         self::MODULE_NGINX,
         self::MODULE_ALL,
     ];
+    public const DEFAULT_MAX_AGE_IN_DAYS = 365;
 
     private string $redirection_export_file_location = '';
+
+    private array $report = [
+        'enabled' => [],
+        'disabled' => [],
+        'never_hit' => [],
+        'is_old' => [],
+    ];
 
     /**
      * Tests redirections from the Redirection plugin to check for 404's, loops etc
      * 
      * [--module=<wordpress|apache|nginx|all>]
      * : Which module to test
+     * 
+     * [--max-age=<int>]
+     * : How many days since a redirect was hit is considered "old"
      */
     public function __invoke( array $args, array $flags ):void
     {
         $flags = wp_parse_args(
             $flags,
-            array(
+            [
                 'module' => $this::DEFAULT_MODULE,
-            )
+                'max-age' => $this::DEFAULT_MAX_AGE_IN_DAYS,
+            ]
         );
 
         if (
@@ -44,13 +57,22 @@ class RedirectionAuditCommand extends AbstractCommandController
             WP_CLI::error('Failed to start');
         }
 
-        $redirection_data = $this->export_redirections( $flags['module'] );
+        $redirection_data = $this->export_redirects( $flags['module'] );
         if ( ! ( $redirection_data['redirects'] ?? false ) ) {
             WP_CLI::success( 'Redirects exported, but no actual redirect rules found. Nothing to do.' );
             return;
         }
 
-        $this->test_redirects( $redirection_data['redirects'] );
+        WP_CLI::log(
+            sprintf( 'Redirection plugin version %s', $redirection_data['plugin']['version'] ?? 'unknown' )
+        );
+
+        $this->test_redirects(
+            $redirection_data['redirects'],
+            $flags['max-age']
+        );
+
+        print_r($this->report);
 
         WP_CLI::success( 'Done' );
     }
@@ -68,7 +90,7 @@ class RedirectionAuditCommand extends AbstractCommandController
 
     private function passes_sanity_check():bool {
         if ( ! is_plugin_active( 'redirection/redirection.php' ) ) {
-            WP_CLI::log( 'The Redirections plugin was not found or was not active. Nothing to audit.' );
+            WP_CLI::log( 'The Redirection plugin was not found or was not active. Nothing to audit.' );
             return false;
         }
 
@@ -101,7 +123,7 @@ class RedirectionAuditCommand extends AbstractCommandController
         return true;
     }
 
-    private function export_redirections( string $module ):array {
+    private function export_redirects( string $module ):array {
         $command = sprintf( 'redirection export %s %s', $module, $this->redirection_export_file_location );
         $response = WP_CLI::runcommand(
             $command,
@@ -115,7 +137,7 @@ class RedirectionAuditCommand extends AbstractCommandController
         );
 
         if ( ( $response->return_code ?? '') !== 0 ) {
-            WP_CLI::error( sprintf( 'Non zero response from command "%s"', $command ), false );
+            WP_CLI::error( sprintf( 'Non-zero response from command "%s"', $command ), false );
             WP_CLI::error( sprintf( 'STDOUT was "%s"', $response->stdout ?? '' ), false );
             WP_CLI::error('Quitting');
         }
@@ -138,12 +160,42 @@ class RedirectionAuditCommand extends AbstractCommandController
         return $redirection_data;
     }
 
-    private function test_redirects( array $redirects )
+    private function test_redirects( array $redirects, int $max_age ):void
     {
         WP_CLI::log( sprintf( 'Found %d redirects to test.', count( $redirects ) ) );
+        $now = new DateTimeImmutable( 'now' );
 
         foreach( $redirects as $redirect ) {
-            
+            if ( ! $redirect['enabled'] ) {
+                $this->report['disabled'][] = $redirect;
+                continue;
+            }
+
+            $this->report['enabled'] = $redirect;
+
+            if ( $redirect['hits'] === 0 ) {
+                $this->report['never_hit'][] = $redirect;
+            } else {
+                $days_since_last_hit = $now->diff( new DateTimeImmutable( $redirect['last_access'] ?? 'now' ), true);
+                if ( $days_since_last_hit > $max_age ) {
+                    $this->report['is_old'][] = $redirect;
+                }
+            }
+
+            switch( $redirect['match_type'] ?? '' ) {
+                case 'url':
+                    $this->test_url_redirect( $redirect );
+                    break;
+                    
+                default:
+                    WP_CLI::error( sprintf( 'Unknown redirect match_type of "%s"', $redirect['match_type'] ?? '' ) );
+                    break;
+            }
         }
+    }
+
+    private function test_url_redirect( array $redirect ):void
+    {
+        
     }
 }
