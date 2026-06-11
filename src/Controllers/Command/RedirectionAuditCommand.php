@@ -2,8 +2,10 @@
 
 namespace OnionWordpressDeveloperToolbox\Controllers\Command;
 
-use DateTimeImmutable;
+use \DateTimeImmutable;
 use \WP_CLI;
+use \WP_Http;
+use OnionWordpressDeveloperToolbox\Exceptions\WpHttpException;
 
 class RedirectionAuditCommand extends AbstractCommandController
 {
@@ -21,21 +23,31 @@ class RedirectionAuditCommand extends AbstractCommandController
         self::MODULE_ALL,
     ];
     public const DEFAULT_MAX_AGE_IN_DAYS = 365;
+    public const DEFAULT_MAX_REDIRECTS = 5;
+    private const LOG_AS_GOOD = 'good';
+    private const LOG_AS_WARNING = 'warning';
+    private const LOG_AS_BAD = 'bad';
 
+    private string $base_url = '';
     private string $redirection_export_file_location = '';
-
     private array $report = [
         'enabled' => [],
         'disabled' => [],
         'never_hit' => [],
         'is_old' => [],
+        'is_bad' => [],
+        'has_warnings' => [],
     ];
+    private ?WP_Http $request;
 
     /**
      * Tests redirections from the Redirection plugin to check for 404's, loops etc
      * 
      * [--module=<wordpress|apache|nginx|all>]
      * : Which module to test
+     * 
+     * [--max-redirects=<int>]
+     * : How many redirects to follow before giving up
      * 
      * [--max-age=<int>]
      * : How many days since a redirect was hit is considered "old"
@@ -47,6 +59,7 @@ class RedirectionAuditCommand extends AbstractCommandController
             [
                 'module' => $this::DEFAULT_MODULE,
                 'max-age' => $this::DEFAULT_MAX_AGE_IN_DAYS,
+                'max-redirects' => $this::DEFAULT_MAX_REDIRECTS,
             ]
         );
 
@@ -63,13 +76,26 @@ class RedirectionAuditCommand extends AbstractCommandController
             return;
         }
 
+        $this->request = new WP_Http;
+
+        // don't use get_site_url() as that can be forced to be the true domain on sites split over multiple instances
+        if ( 
+            ($_ENV['LANDO_APP_NAME'] ?? false)
+            && ($_ENV['LANDO_DOMAIN'] ?? false)
+        ) {
+            $this->base_url = sprintf( 'https://%s.%s', $_ENV['LANDO_APP_NAME'], $_ENV['LANDO_DOMAIN'] );
+        } else {
+            $this->base_url = get_option( 'siteurl' );
+        }
+
         WP_CLI::log(
             sprintf( 'Redirection plugin version %s', $redirection_data['plugin']['version'] ?? 'unknown' )
         );
 
         $this->test_redirects(
             $redirection_data['redirects'],
-            $flags['max-age']
+            $flags['max-age'],
+            $flags['max-redirects']
         );
 
         print_r($this->report);
@@ -83,7 +109,9 @@ class RedirectionAuditCommand extends AbstractCommandController
             $this->redirection_export_file_location
             && file_exists( $this->redirection_export_file_location )
         ) {
-            WP_CLI::log('Removing the export file.');
+            WP_CLI::log(
+                sprintf( 'Removing the export file from %s.', $this->redirection_export_file_location )
+            );
             //wp_delete_file( $this->redirection_export_file_location );
         }
     }
@@ -160,7 +188,7 @@ class RedirectionAuditCommand extends AbstractCommandController
         return $redirection_data;
     }
 
-    private function test_redirects( array $redirects, int $max_age ):void
+    private function test_redirects( array $redirects, int $max_age, int $max_redirects ):void
     {
         WP_CLI::log( sprintf( 'Found %d redirects to test.', count( $redirects ) ) );
         $now = new DateTimeImmutable( 'now' );
@@ -184,7 +212,7 @@ class RedirectionAuditCommand extends AbstractCommandController
 
             switch( $redirect['match_type'] ?? '' ) {
                 case 'url':
-                    $this->test_url_redirect( $redirect );
+                    $this->test_url_redirect( $redirect, $max_redirects );
                     break;
                     
                 default:
@@ -194,8 +222,165 @@ class RedirectionAuditCommand extends AbstractCommandController
         }
     }
 
-    private function test_url_redirect( array $redirect ):void
+    private function test_url_redirect( array $redirect, int $max_redirects ):void
     {
+        if ( ! ( $redirect['match_url'] ?? false ) ) {
+            $this->log( $redirect, self::LOG_AS_BAD, 'Bad or missing match_url in the redirect' );
+            return;
+        }
+
+        if ( ( $redirect['match_data']['source']['flag_query'] ?? false ) !== 'exact' ) {
+            $this->log(
+                $redirect,
+                self::LOG_AS_BAD,
+                sprintf( 'Match type "%s" not yet implemented', $redirect['match_data']['source']['flag_query'] ?? 'unknown' )
+            );
+            return;
+        }
+
+        $url_to_test = $this->base_url . $redirect['match_url'];
+
+        // Add a trailing slash?
+        if (
+            ($redirect['match_data']['source']['flag_trailing'] ?? false)
+            && substr($redirect['match_url'], -1, 1) !== '/'
+        ) {
+            $url_to_test .= '/';
+        }
+
+        $redirection_chain = [];
+        try {
+            $redirection_chain = $this->test_redirection_chain( $url_to_test, $max_redirects );
+        } catch( WpHttpException $e ) {
+            $this->log( $redirect, self::LOG_AS_BAD, $e->getMessage() );
+            return;
+        }
         
+        if ( ! count( $redirection_chain ) ) {
+            $this->log( $redirect, self::LOG_AS_BAD, 'No redirection detected (no response)' );
+            return;
+        }
+        
+        // Check the response code of the first response
+        if ( $redirection_chain[0]['code'] !== ( $redirect['action_code'] ?? false ) ) {
+            $this->log(
+                $redirect,
+                self::LOG_AS_BAD,
+                sprintf(
+                    'Incorrect response code. Expected %s, received %s',
+                    $redirect['action_code'] ?? 'unknown',
+                    $response['response']['code'] ?? 'unknown'
+                )
+            );
+            return;
+        }
+
+        $final_url = $redirection_chain[ count( $redirection_chain ) - 2 ]['location'] ?? false;
+        if ( $final_url !== ( $redirect['action_data']['url'] ?? true ) ) {
+            $this->log(
+                $redirect,
+                self::LOG_AS_BAD,
+                sprintf(
+                    'Incorrect final destination. Expected %s, received %s',
+                    $redirect['action_data']['url'] ?? 'unknown',
+                    $final_url ?: 'unknown'
+                )
+            );
+            return;
+        }
+
+        if ( count( $redirection_chain ) > 2 ) {
+            $this->log(
+                $redirect,
+                self::LOG_AS_WARNING,
+                sprintf(
+                    'Inefficient redirection chain. Chain length is %d',
+                    count( $redirection_chain ) - 1
+                )
+            );
+        } else {
+            $this->log( $redirect, self::LOG_AS_GOOD );
+        }
+    }
+
+    private function test_redirection_chain(
+        string $url,
+        int $max_redirects,
+        array $redirect_chain = []
+        
+    ):array {
+        if ( count( $redirect_chain ) >= $max_redirects ) {
+            throw new WpHttpException(
+                sprintf(
+                    'Hit the max number redirection limit of %d',
+                    $max_redirects,
+                )
+            );
+        }
+
+        $response = $this->request->get( $url, [ 'redirection' => 0 ] );
+        if ( is_wp_error( $response ) ) {
+            throw new WpHttpException(
+                sprintf(
+                    'Request to fetch the URL gave an error; "%s"',
+                    $response->get_error_message()
+                )
+            );
+        }
+
+        $headers = $response['http_response']->get_headers();
+        $this_redirect = [
+            'code' => $response['response']['code'],
+            'location' => $headers['location'] ?? '',
+        ];
+        $redirect_chain[] = $this_redirect;
+
+        // if it's a 3xx response, do some good old recursion!
+        if ( $this_redirect['code'] >= 300 && $this_redirect['code'] < 400 ) {
+            if ( ! $this_redirect['location'] ) {
+                throw new WpHttpException(
+                    sprintf( 'Received a %s response code, but with no location URL to redirect to.', $this_redirect['code'] )
+                );
+            }
+            $redirect_chain = $this->test_redirection_chain(
+                $this->base_url . $this_redirect['location'],
+                $max_redirects,
+                $redirect_chain
+            );
+        }
+
+        return $redirect_chain;
+    }
+
+    private function log( array $redirect, string $log_as, string $reason = '' ) {
+        $message = sprintf(
+            'Redirect #%d, matching url "%s", is bad: %s',
+            $redirect['id'],
+            $redirect['match_url'] ?? 'url missing',
+            $reason
+        );
+
+        switch ( $log_as ) {
+            case self::LOG_AS_GOOD:
+                WP_CLI::log(
+                    sprintf(
+                        'Redirect #%d, matching url "%s", is good.',
+                        $redirect['id'],
+                        $redirect['match_url'] ?? 'url missing'
+                    )
+                );
+                break;
+
+            case self::LOG_AS_WARNING:
+                $this->report['has_warnings'][] = $redirect;
+                WP_CLI::warning( $message );
+                break;
+
+            case self::LOG_AS_BAD:
+            default:
+                $this->report['is_bad'][] = $redirect;
+                WP_CLI::error( $message, false );
+                break;
+        }
     }
 }
